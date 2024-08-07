@@ -1,5 +1,5 @@
 ---
-title: "XR090_heatmap_fpkm_filter"
+title: "XR090_GO_enrichment"
 author: "Alexander Lercher"
 date: "`r Sys.Date()`"
 output: html_document

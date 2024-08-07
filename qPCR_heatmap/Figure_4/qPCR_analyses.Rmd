@@ -1,0 +1,185 @@
+---
+title: "XR017_33_qPCR_analyses"
+author: "Alexander Lercher"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+#--------------------------------------------------------------------
+# LOAD PACKAGES
+#--------------------------------------------------------------------
+library(readr)
+library(tidyverse)
+library(dplyr)
+library(pheatmap)
+
+#--------------------------------------------------------------------
+# DATA IMPORT
+#--------------------------------------------------------------------
+# import
+experiment <- c("XR017_33")
+data <- read_tsv(paste0("input/",experiment,"_dCt.txt"))
+
+# exclude genes not interested in
+names <- data$gene
+names
+
+remove <- c("Marco","Sgk1","Id3","Il6","Acod1")
+keep <- setdiff(names, remove)
+
+# define cytokines as row names
+data <- data %>%
+  filter(gene %in% keep) %>%
+  column_to_rownames(var = "gene")
+
+#--------------------------------------------------------------------
+# SELECT ALVEOLAR MACROPHAGE SAMPLES
+#--------------------------------------------------------------------
+# filter for samples that are significant in at least one comparison
+# add TRUE/FALSE columns for significance
+# if sum of all TRUE/FALSE columns is >1, keep row
+data_sig <- data %>%
+  mutate(sig_nai_rec_ctl = if_else(p_nai_rec_ctl < 0.05,T,F),
+         sig_nai_rec_pIC = if_else(p_nai_rec_pIC < 0.05,T,F),
+         sig_nai_rec_LPS = if_else(p_nai_rec_LPS < 0.05,T,F),
+         sig_nai_rec_PAM = if_else(p_nai_rec_PAM < 0.05,T,F),
+         sig_nai_rec_ODN = if_else(p_nai_rec_ODN < 0.05,T,F),
+         sig_nai_rec_FLA = if_else(p_nai_rec_FLA < 0.05,T,F),
+         sig_nai_rec_R848 = if_else(p_nai_rec_R848 < 0.05,T,F))# %>%
+  # mutate_at(vars(sig_nai_rec_ctl,
+  #                sig_nai_rec_pIC,
+  #                sig_nai_rec_LPS,
+  #                sig_nai_rec_PAM,
+  #                sig_nai_rec_ODN,
+  #                sig_nai_rec_FLA,
+  #                sig_nai_rec_R848), ~replace_na(.,0)) %>%
+  # mutate(sum_pval = rowSums(select(., starts_with("sig_")))) %>%
+  # filter(sum_pval > 0) %>%
+  # select(!sum_pval)
+
+#--------------------------------------------------------------------
+# PLOT HEATMAP with ROW Z SCORES
+#--------------------------------------------------------------------
+# define formula to calculate row Z score
+cal_z_score <- function(x){
+  (x - mean(x)) / sd(x)
+}
+# select individual values (all replicates) to plot
+data_sig_values_only <- data_sig[1:42]
+
+# select mean values (per condition) to plot
+data_sig_values_only_mean <- data_sig[43:56]
+
+# combine in list
+data_sig_list <- list("individual values" = data_sig_values_only, 
+                          "means" = data_sig_values_only_mean)
+
+# calculate row Z score for each row
+data_norm <- list()
+for(i in 1:length(data_sig_list)){
+  n <- t(apply(data_sig_list[[i]], 1, cal_z_score))
+  data_norm[[names(data_sig_list)[[i]]]] <- n
+}
+
+# annotate sample columns for individual samples
+unique_names <- colnames(data_sig_values_only) %>%
+  str_replace("_\\d+$", "") %>%
+  unique() %>%
+  rep(each = 3)
+
+my_sample_col_individual <- data.frame(sample = unique_names)
+
+row.names(my_sample_col_individual) <- colnames(data_sig_values_only)
+
+# annotate sample columns for means
+unique_names <- colnames(data_sig_values_only_mean) %>%
+  str_replace("_\\d+$", "") %>%
+  unique()
+
+my_sample_col_mean <- data.frame(sample = unique_names)
+
+row.names(my_sample_col_mean) <- my_sample_col_mean$sample
+
+my_sample_col <- list("individual values" = my_sample_col_individual,
+                      "means" = my_sample_col_mean)
+
+# calculate dendrogram
+hc <- lapply(X = data_norm, FUN = function(x){
+  hclust(dist(x), method = "complete")
+})
+
+# add cluster information to heatmap
+numberofclusters = 2
+my_gene_col <- list()
+for(i in 1:length(hc)){
+  a <- cutree(hc[[i]], k = numberofclusters)
+  b <- data.frame(cluster = ifelse(test = a == 1, yes = "1", no = "2"))
+  my_gene_col[[names(hc)[[i]]]] <- b
+}
+
+# add column gene to dataframes
+for(i in 1:length(my_gene_col)){
+  my_gene_col[[i]]$gene <- rownames(my_gene_col[[i]])
+}
+
+# info about significant p-value and condition to heatmap annotation
+data_sig_info <- data_sig %>%
+  select(sig_nai_rec_ctl,
+         sig_nai_rec_pIC,
+         sig_nai_rec_LPS,
+         sig_nai_rec_PAM,
+         sig_nai_rec_ODN,
+         sig_nai_rec_FLA,
+         sig_nai_rec_R848)
+data_sig_info$gene <- rownames(data_sig_info)
+
+# merge information about significance to cluster
+for(i in 1:length(my_gene_col)){
+  my_gene_col[[i]] <- left_join(my_gene_col[[i]],data_sig_info)
+  my_gene_col[[i]]$sig_nai_rec_ctl <- as.integer(my_gene_col[[i]]$sig_nai_rec_ctl)
+  my_gene_col[[i]]$sig_nai_rec_pIC <- as.integer(my_gene_col[[i]]$sig_nai_rec_pIC)
+  my_gene_col[[i]]$sig_nai_rec_LPS <- as.integer(my_gene_col[[i]]$sig_nai_rec_LPS)
+  my_gene_col[[i]]$sig_nai_rec_PAM <- as.integer(my_gene_col[[i]]$sig_nai_rec_PAM)
+  my_gene_col[[i]]$sig_nai_rec_ODN <- as.integer(my_gene_col[[i]]$sig_nai_rec_ODN)
+  my_gene_col[[i]]$sig_nai_rec_FLA <- as.integer(my_gene_col[[i]]$sig_nai_rec_FLA)
+  my_gene_col[[i]]$sig_nai_rec_R848 <- as.integer(my_gene_col[[i]]$sig_nai_rec_R848)
+  rownames(my_gene_col[[i]]) <- my_gene_col[[i]]$gene
+  my_gene_col[[i]]$gene <- NULL
+}
+
+# generate and save heatmap
+for(i in 1:length(data_norm)){
+  pheatmap(data_norm[[i]], annotation_col = my_sample_col[[i]], annotation_row = my_gene_col[[i]],
+         show_rownames = T, fontsize_row = 4,
+         cluster_cols = F,
+         width = 8, height = 4,
+         color = hcl.colors(50, "Viridis"),
+         main = paste0(experiment,"  - ","gene profile of ",names(data_norm[i])),
+         cutree_rows = numberofclusters,
+         filename = paste0("output/",experiment,"_","genes_",sub(" ","_",names(data_norm[i])),".pdf"))
+}
+
+#--------------------------------------------------------------------
+# APPENDIX
+#--------------------------------------------------------------------
+# which R packages and versions?
+if ("devtools" %in% installed.packages()) devtools::session_info()
+
+
+
+
+
+
+```
+
