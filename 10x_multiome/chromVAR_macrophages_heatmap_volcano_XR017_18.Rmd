@@ -1,0 +1,150 @@
+---
+title: "XR017_18_TF_macros_heatmap_volcano"
+author: "Alexander Lercher"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+#--------------------------------------------------------------------
+# LOAD PACKAGES
+#--------------------------------------------------------------------
+library(readr)
+library(tidyverse)
+library(dplyr)
+library(pheatmap)
+library(EnhancedVolcano)
+
+#--------------------------------------------------------------------
+# DATA IMPORT AND CLEANUP CHROMVAR OUTPUT ALL CLUSTERS
+#--------------------------------------------------------------------
+data <- read.csv("input/macs_diff_chromvar.csv")
+
+
+#--------------------------------------------------------------------
+# FILTER for and identify SIGNIFICANT REGIONS
+#--------------------------------------------------------------------
+# define log2FC and adjPval cutoffs
+log2FC_cutoff = 0
+adjpval_cutoff = 0.001
+
+# subset data by cutoff criteria
+significant <- data %>%
+  filter(abs(avg_log2FC) > log2FC_cutoff & p_val_adj < adjpval_cutoff)
+
+#--------------------------------------------------------------------
+# FIND FOS/JUN, NFKB, IRF BINDING SITES
+#--------------------------------------------------------------------
+IRF <- as.integer(grepl("IRF|STAT|Stat",significant$motifname))
+NFKB <- as.integer(grepl("REL|NFK",significant$motifname))
+FOS <- as.integer(grepl("FOS|JUN",significant$motifname))
+
+significant$IRF <- IRF
+significant$NFKB <- NFKB
+significant$FOS <- FOS
+
+#--------------------------------------------------------------------
+# PLOT HEATMAP (nomral and log2 transformed values)
+#--------------------------------------------------------------------
+# annotate sample columns
+rownames(significant) <- significant$motif
+data_to_plot <- significant %>%
+  dplyr::select(pct.1,pct.2)
+
+my_sample_col <- data.frame(sample = c("recovered","naive"))
+row.names(my_sample_col) <- colnames(data_to_plot)
+
+# calculate dendrogram and define row annotations
+hc <- hclust(dist(data_to_plot), method = "complete")
+
+numberofclusters = 4
+my_gene_col <-cutree(hc, k = numberofclusters)
+my_gene_col <- data.frame(cluster = ifelse(test = my_gene_col == 1, yes = "1", no = "2"))
+
+# merge IRF and RELA info to row annotations
+IRF_NFKB_FOS <- significant %>%
+  dplyr::select(motif,IRF,NFKB,FOS) %>%
+  dplyr::rename(gene_id = motif)
+  
+my_gene_col$gene_id <- rownames(my_gene_col)
+my_gene_col <- my_gene_col %>%
+  left_join(IRF_NFKB_FOS)
+rownames(my_gene_col) <- my_gene_col$gene_id
+my_gene_col$gene_id <- NULL
+
+# plot heatmap
+pheatmap(data_to_plot, annotation_col = my_sample_col, annotation_row = my_gene_col, 
+         show_rownames = F, main = "pooled macros chromvar",
+         #color = colorRampPalette(c("midnightblue", "ivory", "firebrick3"))(50),
+         cutree_rows = numberofclusters,
+         filename = "output/diffTF_heatmaps/macros_chromvar.pdf")
+
+# plot log2 transformed heatmap
+pheatmap(-log2(data_to_plot), annotation_col = my_sample_col, annotation_row = my_gene_col, 
+         show_rownames = F, main = "pooled macros chromvar log2 transformed",
+         #color = colorRampPalette(c("midnightblue", "ivory", "firebrick3"))(50),
+         cutree_rows = numberofclusters,
+         filename = "output/diffTF_heatmaps/macros_chromvar_log2.pdf")
+
+#--------------------------------------------------------------------
+# PLOT VOLCANO PLOT
+#--------------------------------------------------------------------
+# prepare volcano data, add log2FC column
+data_volcano <- data
+row.names(data_volcano) <- data_volcano$motifname
+
+data_volcano <- data_volcano %>%
+  dplyr::rename(gene_id = motifname) %>%
+  dplyr::mutate(log2FC = log2(pct.1/pct.2))
+
+# extract TFs containing IRF/STAT/REL/NFKB/FOS/JUN in their names
+IRF_names <- grep("IRF|STAT|Stat",data_volcano$gene_id, value = T)
+NFKB_names <- grep("REL|NFK",data_volcano$gene_id, value = T)
+FOS_names <- grep("FOS|JUN",data_volcano$gene_id, value = T)
+
+# generate a list for all of them
+names <- list(IRF_STAT = IRF_names,NFkB = NFKB_names,FOS_JUN = FOS_names)
+long_names<- c("IRF or STAT","NFkB","FOS or JUN")
+
+# plot volcano with labels for TFs of interest
+for(i in 1:length(names)){
+  gg <- EnhancedVolcano(data_volcano,
+                        lab = rownames(data_volcano),
+                        x = 'avg_log2FC',
+                        y = 'p_val_adj',
+                        title = paste0('Differential chromatin access for ',long_names[i],' associated TFs'),
+                        subtitle = "chromVAR pooled macrophages recovered vs naive",
+                        pCutoff = 10e-20,
+                        FCcutoff = 0.25,
+                        legendLabSize = 10,
+                        pointSize = 7,
+                        xlim = c(-4,4),
+                        col=c('gray', 'gray', 'gray', 'firebrick'),
+                        colAlpha = 0.5,
+                        selectLab = c(names[[i]]),
+                        max.overlaps = Inf,
+                        drawConnectors = TRUE) + theme_bw() + theme(aspect.ratio = 1)
+  ggsave(paste0("output/diffTF_volcanos/DiffTF_macros_",names(names[i]),".pdf"), 
+         width = 30,height = 30,units = c("cm"),dpi = 300)
+}
+
+#--------------------------------------------------------------------
+# APPENDIX
+#--------------------------------------------------------------------
+# which R packages and versions?
+if ("devtools" %in% installed.packages()) devtools::session_info()
+
+
+
+```
+

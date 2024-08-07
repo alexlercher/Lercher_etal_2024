@@ -1,0 +1,287 @@
+---
+title: "XR129_1_AMF_VSV-GFP"
+author: "Alexander Lercher"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(data.table)
+
+# define experiment name
+exp <- "XR129_1_VSV-GFP_"
+date <- "20230306/"
+
+# load in csv files - only columns of interest (huge files)
+primObj <- fread("input/XR129_1_VSV-GFP_20230306_IdentifyPrimaryObjects.csv",
+                 select = c("ImageNumber",
+                            "ObjectNumber",
+                            "Metadata_Well",
+                            "Intensity_MeanIntensity_DAPI",
+                            "Intensity_MeanIntensity_GFP"))
+
+secObj <- fread("input/XR129_1_VSV-GFP_20230306_IdentifySecondaryObjects.csv",
+                select = c("ImageNumber",
+                           "ObjectNumber",
+                           "Metadata_Well",
+                           "Intensity_MeanIntensity_GFP"))
+
+# define cell type
+cellType <- c("aMF + VSV-GFP")
+green_cells = c("VSV-GFP")
+# green_cells = c("infected")
+
+# clean up tables
+# select columns of interest
+
+primObj_clean <- primObj %>%
+  select(ImageNumber,
+         ObjectNumber,
+         Metadata_Well,
+         Intensity_MeanIntensity_DAPI,
+         Intensity_MeanIntensity_GFP) %>%
+  rename(CellNumber = ObjectNumber,
+         WellNumber = Metadata_Well,
+         MeanDAPI_primObj = Intensity_MeanIntensity_DAPI,
+         MeanGFP_primObj = Intensity_MeanIntensity_GFP)
+
+secObj_clean <- secObj %>%
+  select(Intensity_MeanIntensity_GFP) %>%
+  rename(MeanGFP_secObj = Intensity_MeanIntensity_GFP)
+
+data = cbind(primObj_clean,secObj_clean)
+
+# define groups and replicates
+plate_rows = LETTERS[2:7]
+columns = as.character(c(2:9))
+
+wellnames = data.frame()
+for(i in 1:length(plate_rows))
+{
+  for(j in 1:length(columns))
+  {
+    wells = as.data.frame(paste0(plate_rows[i],columns[j]))
+    wellnames = rbind(wellnames,wells)
+  }
+}
+wellnames = as.character(wellnames[,1])
+
+groups = data.frame( 
+  "WellNumber" = wellnames,
+  "CellType" = rep(c("naive+iso","naive+aIFNAR","polyIC+iso","polyIC+aIFNAR"),each=2),
+  "Condition" = rep(c("control","E-5","E-6"),each=16),
+  "Replicate" = rep(c("replicate1","replicate2","replicate1","replicate2","replicate1","replicate2","replicate1","replicate2",
+                      "replicate3","replicate4","replicate3","replicate4","replicate3","replicate4","replicate3","replicate4"),3))
+
+# merge group and replicate info to big table
+data_groups <- merge(data,groups, by = c("WellNumber"))
+
+# order groups by cell type and condition
+order_cond = c("control","E-5","E-6")
+order_celltype = c("naive+iso","naive+aIFNAR","polyIC+iso","polyIC+aIFNAR")
+data_groups$Condition <- factor(data_groups$Condition,levels = order_cond)
+data_groups$CellType <- factor(data_groups$CellType,levels = order_celltype)
+
+# Density plots with semi-transparent fill
+library(ggplot2)
+library(hexbin)
+
+# plot DAPI distribution per condition and replicate from primary mask
+ggplot(data_groups, aes(x=MeanDAPI_primObj, color=Replicate)) +
+  geom_density() +
+  ggtitle(cellType, "primary object mean DAPI") +
+  scale_color_brewer(palette = "Dark2") +
+  facet_wrap(CellType ~ Condition) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+  theme(strip.text = element_text(size = rel(0.4)))
+
+# filter out DAPI noise
+DAPInoiseCutoff = 0.125
+
+data_groups_cutoff <- data_groups %>%
+  filter(MeanDAPI_primObj > DAPInoiseCutoff)
+
+ggplot(data_groups_cutoff, aes(x=MeanDAPI_primObj, color=Replicate)) +
+  geom_density() +
+  ggtitle(cellType, "primary object mean DAPI after cutoff") +
+  scale_color_brewer(palette = "Dark2") +
+  facet_wrap(CellType ~ Condition) +
+  geom_vline(xintercept = DAPInoiseCutoff) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+  theme(strip.text = element_text(size = rel(0.5)))
+
+# plot cell counts per well
+data_groups_cutoff %>%
+  group_by(CellType, Condition, Replicate) %>%
+  count() %>%
+  ggplot(aes(x=Condition, y=n, fill=Condition)) +
+  geom_boxplot(outlier.shape = NA) +
+  ylab("cell count") +
+  scale_fill_brewer(palette="YlOrRd") +
+  geom_jitter(color="black",size=2, alpha=0.6) +
+  facet_wrap(~CellType) +
+  ggtitle(cellType, "Cell count") +
+  ylim(0,NA) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))
+  ggsave(paste0("output/",date,exp,"cell_count.pdf"))
+
+# print cell count per well
+data_groups_cutoff %>%
+  group_by(WellNumber,CellType,Condition,Replicate) %>%
+  summarise(Count=n()) %>%
+  write_tsv(file = paste0("output/",date,exp,"cell_count.tsv")) %>%
+  print(n=150)
+
+# plot GFP prim obj distributions after DAPI cutoff
+data_groups_cutoff %>%
+  ggplot(aes(x=MeanGFP_primObj, color=Replicate)) +
+  geom_density() +
+  ggtitle(cellType, paste("prim object mean",green_cells,"after DAPI cutoff")) +
+  scale_color_brewer(palette = "Dark2") +
+  facet_wrap(CellType ~ Condition) +
+  theme_bw()+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+  theme(strip.text = element_text(size = rel(0.5)))
+
+# define Red prim obj cutoff based on plots here
+GFP_prim_cutoff = 0.1
+
+data_groups_cutoff %>%
+  ggplot(aes(x=MeanGFP_primObj, color=Replicate)) +
+  geom_density() +
+  ggtitle(cellType, "Mean GFP prim obj with cutoff") +
+  scale_color_brewer(palette = "Dark2") +
+  facet_wrap(CellType ~ Condition) +
+  geom_vline(xintercept = GFP_prim_cutoff) +
+  theme_bw()+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+  theme(strip.text = element_text(size = rel(0.5)))
+
+# add column to classify infected vs naive
+data_groups_cutoff <- data_groups_cutoff %>%
+  mutate(GFP_prim = if_else(MeanGFP_primObj > GFP_prim_cutoff,T,F))
+
+# plot GFP sec obj distributions after DAPI cutoff
+ggplot(data_groups_cutoff, aes(x=MeanGFP_secObj, color=Replicate)) +
+  geom_density() +
+  ggtitle(cellType, paste("sec object mean",green_cells,"after DAPI cutoff")) +
+  scale_color_brewer(palette = "Dark2") +
+  facet_wrap(CellType ~ Condition) +
+  theme_bw()+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+  theme(strip.text = element_text(size = rel(0.5)))
+
+# define GFP sec obj cutoffs based on plots here
+GFP_sec_cutoff = 0.1
+ggplot(data_groups_cutoff, aes(x=MeanGFP_secObj, color=Replicate)) +
+  geom_density() +
+  ggtitle(cellType, "Mean GFP sec object with cutoff") +
+  scale_color_brewer(palette = "Dark2") +
+  facet_wrap(CellType ~ Condition) +
+  geom_vline(xintercept = GFP_sec_cutoff) +
+  theme_bw()+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+  theme(strip.text = element_text(size = rel(0.5)))
+
+# add column to classify infected vs naive
+data_groups_cutoff <- data_groups_cutoff %>%
+  mutate(GFP_sec = if_else(MeanGFP_secObj > GFP_sec_cutoff,T,F))
+
+# calculate number of Red cells primary object per condition and replicate
+percentGFP_prim <- data_groups_cutoff %>%
+  group_by(CellType,Condition,Replicate,GFP_prim) %>%
+  summarise(Count=n()) %>%
+  ungroup() %>%
+  complete(CellType,Condition, Replicate,nesting(GFP_prim),fill=list(Count = 0)) %>%
+  group_by(CellType,Condition,Replicate) %>%
+  mutate(Percentage_GFP_prim = 100*Count/sum(Count)) %>%
+  drop_na() %>%
+  write_tsv(file = paste0("output/",date,exp,"percent_GFP_nuclei.tsv")) %>%
+  print(n=150)
+
+# plot number of Red cells in prim object
+percentGFP_prim %>%
+  filter(GFP_prim == T) %>%
+  ggplot(aes(x=Condition, y=Count, fill=Condition)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(color="black",size=2, alpha=0.6) +
+  scale_fill_brewer(palette="YlOrRd") +
+  ggtitle(cellType, paste("Number of",green_cells,"nuclei")) +
+  facet_grid(~ CellType, scale="free") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1)) +
+  ylim(0,NA)
+
+# plot percent of green cells
+percentGFP_prim %>%
+  filter(GFP_prim == T) %>%
+  ggplot(aes(x=Condition, y=Percentage_GFP_prim, fill=Condition)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(color="black",size=2, alpha=0.6) +
+  scale_fill_brewer(palette="YlOrRd") +
+  ggtitle(cellType, paste("Percentage of",green_cells,"nuclei")) +
+  facet_grid(~ CellType, scale="free") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1)) +
+  ylim(0,NA)
+  ggsave(paste0("output/",date,exp,"percent_GFP_nuclei.pdf"))
+
+# calculate number of green cells secondary object per condition and replicate
+percentGFP_sec <- data_groups_cutoff %>%
+  group_by(CellType,Condition,Replicate,GFP_sec) %>%
+  summarise(Count=n()) %>%
+  ungroup() %>%
+  complete(CellType, Condition, Replicate, nesting(GFP_sec), fill = list(Count = 0)) %>%
+  group_by(CellType,Condition,Replicate) %>%
+  mutate(Percentage_GFP_sec = 100*Count/sum(Count)) %>%
+  drop_na() %>%
+  write_tsv(file = paste0("output/",date,exp,"percent_GFP_cells.tsv")) %>%
+  print(n=150)
+
+# plot number of Red cells secondary object
+percentGFP_sec %>%
+  filter(GFP_sec == T) %>%
+  ggplot(aes(x=Condition, y=Count, fill=Condition)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(color="black",size=2, alpha=0.6) +
+  scale_fill_brewer(palette="YlOrRd") +
+  ggtitle(cellType, paste("Number of",green_cells,"cells in secondary obj")) +
+  facet_grid(~ CellType, scale="free") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1)) +
+  ylim(0,NA)
+
+# plot percent Red cells secondary
+percentGFP_sec %>%
+  filter(GFP_sec == T) %>%
+  ggplot(aes(x=Condition, y=Percentage_GFP_sec, fill=Condition)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(color="black",size=2, alpha=0.6) +
+  scale_fill_brewer(palette="YlOrRd") +
+  ggtitle(cellType, paste("Percentage of",green_cells,"cells in secondary obj")) +
+  facet_grid(~ CellType, scale="free") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+  ylim(0,NA)
+  ggsave(paste0("output/",date,exp,"percent_GFP_cells.pdf"))
+
+
+
+```
+

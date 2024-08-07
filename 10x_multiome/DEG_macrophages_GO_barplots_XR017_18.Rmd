@@ -1,0 +1,93 @@
+---
+title: "XR017_18_DEG_macros_GO_barplots"
+author: "Alexander Lercher"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+#--------------------------------------------------------------------
+# LOAD PACKAGES
+#--------------------------------------------------------------------
+library(readr)
+library(tidyverse)
+library(dplyr)
+library(readxl)
+library(viridis)
+library(ggplot2)
+
+#--------------------------------------------------------------------
+# DATA IMPORT
+#--------------------------------------------------------------------
+# Directory path
+directory <- "output/DEG_macros"
+
+# List all .tsv files in the directory
+tsv_files <- list.files(directory, pattern = "\\.tsv$", full.names = TRUE)
+file_names <- tools::file_path_sans_ext(basename(tsv_files))
+
+# Read each .tsv file into a list
+data_list <- list()
+for (i in 1:length(tsv_files)) {
+  data <- read_tsv(tsv_files[[i]])
+  data_list[[file_names[i]]] <- data
+}
+
+#--------------------------------------------------------------------
+# FILTER DATA FOR TOP 10 TF factors
+#--------------------------------------------------------------------
+for(i in 1:length(file_names)){
+data_up_rec <- data_list[[i]] %>%
+  filter(str_detect(Cluster, "rec")) %>%
+  arrange(p.adjust) %>%
+  slice(1:10)
+
+data_up_nai <- data_list[[i]] %>%
+  filter(str_detect(Cluster, "nai")) %>%
+  arrange(p.adjust) %>%
+  slice(1:10)
+
+list = list("Top_10_up_in_recovered" = data_up_rec, "Top_10_up_in_naive" = data_up_nai)
+
+#--------------------------------------------------------------------
+# PLOT as BARGRAPH
+#--------------------------------------------------------------------
+for(j in 1:length(list)){
+plot_list <- list()
+p <-  ggplot(list[[j]], aes(x=-log10(p.adjust), y=reorder(Description,-log10(p.adjust)), fill = -log10(p.adjust))) + 
+        geom_bar(stat = "identity") +
+        scale_fill_viridis(name = "-log10(adj_pval)") +
+        xlab("-log10(adj_pval)") +
+        ylab("GO Term") +
+        ggtitle(paste0(gsub("_", " ", file_names[i])," ",gsub("_", " ", names(list)[j]))) +
+        theme_bw() +
+        theme(aspect.ratio = 1)
+        
+ggsave(p, file=paste0("output/DEG_macros/",file_names[i],"_",names(list)[j],".pdf"),
+       dpi = 300, units = c("cm"),width = 30, height = 30)
+plot_list[[paste0(file_names[j])]] <- p
+}
+}
+plot_list
+
+
+#--------------------------------------------------------------------
+# APPENDIX
+#--------------------------------------------------------------------
+# which R packages and versions?
+if ("devtools" %in% installed.packages()) devtools::session_info()
+
+
+
+```
+

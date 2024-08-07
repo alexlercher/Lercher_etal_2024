@@ -1,0 +1,406 @@
+---
+title: "XR017_4_DEG_GO_analyses_clusters"
+author: "Alexander Lercher"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+#--------------------------------------------------------------------
+# LOAD PACKAGES
+#--------------------------------------------------------------------
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(ggplot2)
+library(ggpubr)
+library(knitr)
+library(DOSE)  
+library(enrichplot)
+library(clusterProfiler)
+
+#--------------------------------------------------------------------
+# LOAD in SEURAT RDS files from BRAD
+#--------------------------------------------------------------------
+BALF_combined <- readRDS(file = "../sarscov2iavbalf_scRNASeq.RDS")
+
+
+# inspect data from Brad - major and minor groups
+DimPlot(BALF_combined, reduction = "umap", group.by = "major_group", label = TRUE, repel = TRUE) +
+  theme(aspect.ratio = 1) +
+  labs(title = "major groups") +
+  NoLegend()
+
+DimPlot(BALF_combined, reduction = "umap", group.by = "minor_group", label = TRUE, repel = TRUE) +
+  theme(aspect.ratio = 1) +
+  labs(title = "minor groups") +
+  NoLegend()
+
+DimPlot(BALF_combined, reduction = "umap", group.by = "minor_group", split.by = "group", label = TRUE, repel = TRUE) +
+  theme(aspect.ratio = 1) +
+  labs(title = "experimental groups") +
+  NoLegend()
+
+#--------------------------------------------------------------------
+# RENAME MINOR GROUPS according to my preferences
+#--------------------------------------------------------------------
+# inspect minor group levels by brad
+levels(BALF_combined@meta.data$minor_group)
+
+# add my annotations, print table
+my_annotations <- data.frame(brads_annotations = levels(BALF_combined@meta.data$minor_group),
+                                my_annotations = c("CD4","CD8","gdT","NKT","lowUMI","B","NK",
+                                                   "macrophage_cluster2","macrophage_cluster1",
+                                                   "cDC1","cDC2","mregDC","pDC","neutrophil","epithelial")) %>%
+  print()
+
+# save my annotations / overwrite Brad's annotations
+levels(BALF_combined@meta.data$minor_group) <- my_annotations$my_annotations
+
+# plot and compare with previous annotations (if correct)
+DimPlot(BALF_combined, reduction = "umap", group.by = "minor_group", label = T, repel = T) +
+  theme(aspect.ratio = 1) +
+  labs(title = "minor groups") +
+  NoLegend()
+ggsave(paste0("output/UMAPs/UMAP_minor_groups.pdf"))
+
+#--------------------------------------------------------------------
+# RENAME EXPERIMENTAL GROUPS according to my preferences
+#--------------------------------------------------------------------
+# brad saved groups as character -> save them as factor
+BALF_combined@meta.data$group <-  as.factor(BALF_combined@meta.data$group)
+# inspect experimental group levels by brad
+levels(BALF_combined@meta.data$group)
+
+# add my annotations, print table
+my_annotations_grp <- data.frame(brads_annotations = levels(BALF_combined@meta.data$group),
+                             my_annotations = c("PR8_only","MA10andPR8")) %>%
+  print()
+
+# save my annotations / overwrite Brad's annotations
+levels(BALF_combined@meta.data$group) <- my_annotations_grp$my_annotations
+
+# plot and compare with previous annotations (if correct)
+DimPlot(BALF_combined, reduction = "umap", group.by = "minor_group", split.by = "group", label = TRUE, repel = TRUE) +
+  theme(aspect.ratio = 1) +
+  labs(title = "experimental groups") +
+  NoLegend()
+ggsave(paste0("output/UMAPs/UMAP_minor_groups_per_condition.pdf"))
+
+DimPlot(BALF_combined, reduction = "umap", group.by = "group", label = TRUE, repel = TRUE) +
+  theme(aspect.ratio = 1) +
+  labs(title = "experimental groups")
+ggsave(paste0("output/UMAPs/UMAP_by_condition.pdf"))
+
+#--------------------------------------------------------------------
+# SAVE NEW ANNOTATIONS AS RDS FILE
+#--------------------------------------------------------------------
+saveRDS(BALF_combined, file = "input/sarscov2iavbalf_scRNASeq_AL.RDS")
+
+#--------------------------------------------------------------------
+# GET CELL COUNTS per CLUSTER, CALCULATE rel ABUNDANCE per SAMPLE
+#--------------------------------------------------------------------
+# set idents to minor cluster
+Idents(BALF_combined) <- "minor_group"
+
+# cell count per minor cluster
+countPerCluster <- table(BALF_combined@active.ident)
+total_count <- as.data.frame(countPerCluster)
+
+# cell count per cluster per condition
+countPerCondition <- SplitObject(BALF_combined, split.by = "group")
+countPerCondition <- lapply(X = countPerCondition, function(x){
+  table(Idents(x))
+})
+condition_count <- as.data.frame(countPerCondition)
+
+cell_count <- cbind(total_count,condition_count)
+cell_count <- cell_count %>%
+  dplyr::select(Var1,Freq,PR8_only.Freq,MA10andPR8.Freq) %>%
+  dplyr::rename(cluster = Var1,
+                total = Freq,
+                PR8_only = PR8_only.Freq,
+                MA10andPR8 = MA10andPR8.Freq) %>%
+  mutate(inputratio = sum(PR8_only)/sum(MA10andPR8)) %>%
+  mutate(inpCorrRatio_MA10andPR8vsPR8_only = (inputratio*MA10andPR8)/PR8_only) %>%
+  dplyr::select(-inputratio) %>%
+  kable(caption = "Cell counts per cluster and condition") %>%
+  print()
+
+#--------------------------------------------------------------------
+# DEG IDENTIFICATION betw CONDITIONS
+#--------------------------------------------------------------------
+# plot average expression of average expression of both conditions and look for outliers on scatterplot
+Idents(BALF_combined) <- "minor_group"
+number_of_clusters = nlevels(BALF_combined)
+
+plot_list = list()
+for(i in 1:number_of_clusters){
+  cluster <- subset(BALF_combined, idents = levels(BALF_combined)[i])
+  Idents(cluster) <- "group"
+  avg_expression <- as.data.frame(log1p(AverageExpression(cluster, verbose = F)$RNA))
+  avg_expression$gene <- rownames(avg_expression) 
+  p1 <- ggplot(avg_expression, aes(PR8_only,MA10andPR8)) +geom_point() + ggtitle(paste0("cluster ",i," ",as.character(levels(BALF_combined)[i]))) + theme_classic() + theme(aspect.ratio = 1)
+  plot_list[[paste0("cluster ",i," ",as.character(levels(BALF_combined)[i]))]] <- p1
+}
+plot_list
+
+# identify genes that are different between conditions within the same cluster
+# first add metadata slot that contains cluster and condition information
+# then switch the current ident to that column
+BALF_combined$celltype_condition <-  paste(Idents(BALF_combined), BALF_combined$group, sep = "_")
+BALF_combined$celltype <- Idents(BALF_combined)
+Idents(BALF_combined) <- "celltype_condition"
+
+# define minimum p value cutoff
+min_pval <-  0.05
+
+# create list of cluster names from annotation table
+# exclude low_UMI
+cluster_names <- my_annotations %>%
+  dplyr::select(my_annotations) %>%
+  filter(!grepl("low", my_annotations))
+cluster_names <- cluster_names$my_annotations
+
+# use FindMarkers to find genes that are different between conditions within a cluster
+# compile all in one file
+DEG_MA10PR8vsPR8 <- data.frame()
+for(i in 1:number_of_clusters){
+  condition1 <- paste0(cluster_names[i],"_MA10andPR8")
+  condition2 <- paste0(cluster_names[i],"_PR8_only")
+  Idents(BALF_combined) <- "celltype_condition"
+  DEG <- FindMarkers(BALF_combined, ident.1 = condition1, ident.2 = condition2, verbose = FALSE)
+  DEG$cluster <- c(as.character(cluster_names[i]))
+  DEG <- filter(DEG, p_val_adj < min_pval)
+  DEG$gene <- rownames(DEG)
+  DEG_MA10PR8vsPR8 <- rbind(DEG_MA10PR8vsPR8,DEG)
+  rm(DEG)
+}
+
+# generate cell type table with cluster number, ranked by number of DEG
+cellTypeTable <- DEG_MA10PR8vsPR8 %>%
+  group_by(cluster) %>%
+  count() %>%
+  dplyr::rename(geneCount = n,
+                cellType = cluster) %>%
+  arrange(desc(geneCount))
+cellTypeTable$cluster = rownames(cellTypeTable)
+
+# add cluster number to DEG list
+DEG_MA10PR8vsPR8 <- DEG_MA10PR8vsPR8 %>%
+  dplyr::rename(cellType = cluster) %>%
+  left_join(cellTypeTable) %>%
+  dplyr::select(!geneCount)
+
+# write DEG to file
+DEG_MA10PR8vsPR8 %>%
+  write.table(file="output/DEG_lists/DEG_MA10PR8vs_PR8.tsv", quote=FALSE, sep='\t', row.names = F)
+
+# identify top 10 DEG per cluster
+top10pos_MA10PR8vsPR8 <- DEG_MA10PR8vsPR8 %>%
+  filter(avg_log2FC > 0) %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC) %>%
+  arrange(cluster)
+
+top10pos_MA10PR8vsPR8 %>%
+  kable(caption = "MA10+PR8 vs PR8_only top10 positively regulated genes per cluster") %>%
+  print(top10pos_MA10PR8vsPR8)
+
+top10neg_MA10PR8vsPR8 <- DEG_MA10PR8vsPR8 %>%
+  filter(avg_log2FC < 0) %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = -avg_log2FC) %>%
+  arrange(cluster)
+
+top10neg_MA10PR8vsPR8 %>%
+  kable(caption = "MA10+PR8 vs PR8_only top10 negatively regulated genes per cluster") %>%
+  print(top10neg_MA10PR8vsPR8)
+
+# violin plot of selected genes
+p <- VlnPlot(BALF_combined, features = c("Ifnb1","Cd44","Ifit1"), split.by = "group",
+                 pt.size = 0, combine = FALSE)
+p
+
+# UMAP plot of selected genes
+p <- FeaturePlot(BALF_combined, features = c("Tcf7","Cd44","Ifit1"), split.by = "group", max.cutoff = 3,
+            cols = c("grey", "firebrick3"))
+p
+
+#--------------------------------------------------------------------
+# CONVERT GENE IDs to ENTREZIDs
+#--------------------------------------------------------------------
+# for enrichment analyses, add ENTREZID
+library(org.Mm.eg.db)
+mm <- org.Mm.eg.db
+my.symbols <- unique(DEG_MA10PR8vsPR8$gene)
+gene_list_ENTREZID <- AnnotationDbi::select(mm, 
+       keys = my.symbols,
+       columns = c("ENTREZID", "SYMBOL"),
+       keytype = "SYMBOL")
+
+colnames(gene_list_ENTREZID) <- c("gene","ENTREZID")
+
+DEG_MA10PR8vsPR8 <- merge(DEG_MA10PR8vsPR8,gene_list_ENTREZID,by = c("gene"))
+
+
+#--------------------------------------------------------------------
+# GO ENRICHMENT ANALYSES
+#--------------------------------------------------------------------
+# GO enrichment analyses
+# note if there is a continuous scale, this means only up/down regulated genes could be enriched
+# NOTE - only enrichment until cluster 8, for higher clusters no enrichment
+min_GO_pval <- 0.001
+
+GO_plot_list <- list()
+for(i in 1:number_of_clusters){
+  cellTypeName <- cellTypeTable %>%
+    filter(cluster == as.character(i)) %>%
+    dplyr::select(cellType)
+  
+  upregulated <- DEG_MA10PR8vsPR8 %>%
+    filter(cluster == as.character(i)) %>%
+    filter(avg_log2FC > 0) %>%
+    dplyr::select(ENTREZID) %>%
+    dplyr::rename(genes = ENTREZID)
+
+  downregulated <- DEG_MA10PR8vsPR8 %>%
+    filter(cluster == as.character(i)) %>%
+    filter(avg_log2FC < 0) %>%
+    dplyr::select(ENTREZID) %>%
+    dplyr::rename(genes = ENTREZID)
+
+  updownRegulated <- as.list(c(upregulated = upregulated,downregulated = downregulated))
+
+  yy <- compareCluster(geneCluster   = updownRegulated,
+               fun           = "enrichGO",
+               pvalueCutoff  = min_GO_pval,
+               pAdjustMethod = "BH", 
+               OrgDb = org.Mm.eg.db, 
+               ont = 'BP')
+  yy <- pairwise_termsim(yy)
+  write_tsv(yy@compareClusterResult, paste0("output/GO_enrichment/GO_cluster_",i,".tsv"))
+  p2 <- emapplot(yy, pie="count", min.edge=0.3, cex_category=2, cex_line=0.5, cex_label_category=0.5, layout = "nicely", repel = T) +
+    ggtitle(paste0("GO Enrichment Network MA10+PR8 vs PR8 of cluster ",i," -> ",as.character(cellTypeName))) +
+    theme(aspect.ratio = 1,plot.title = element_text(size=10))
+  GO_plot_list[[paste0("cluster_",i)]] <- p2
+  ggsave(p2, file=paste0("output/GO_enrichment/GO_cluster_",i,".pdf"),dpi = 300, units = c("cm"),width = 30, height = 30)
+  print(paste0("cluster_",i," done!"))
+  rm(upregulated,downregulated,updownRegulated,yy,p2)
+}
+GO_plot_list
+
+#--------------------------------------------------------------------
+# ISG ANALYSES
+#--------------------------------------------------------------------
+# import ISG list from Schoggins Nature paper, generated by Alex Popa
+# problem is that all ISGs are in full caps
+ISG_list = read.table("input/ISG_List.csv", dec=",", sep=";", header = T)
+
+# here i will put the gene names in lower case
+# gene names are separated into first letter and rest
+# first letter is capitalized, rest is kept lowercase
+ISG_list = ISG_list %>%
+  mutate(gene_low = tolower(gene),
+         first_letter = substr(gene_low,1,1),
+         first_letter_cap = toupper(first_letter),
+         rest = substr(gene_low,2,20)
+  )
+
+# save ISG list as dataframe with the column name "gene"
+# add a TRUE column for all ISGs
+ISG_list = as.data.frame(paste(ISG_list$first_letter_cap,ISG_list$rest,sep=""))
+colnames(ISG_list) = c("gene")
+ISG_list$ISG = T
+
+# merge ISG_list with DEG_MA10PR8vsPR8 list to get only significant ISGs
+sig_ISG_list <- merge(DEG_MA10PR8vsPR8,ISG_list, by = c("gene"))
+sig_ISG_list <-  sig_ISG_list %>%
+  group_by(cluster) %>%
+  arrange(by = avg_log2FC) %>%
+  arrange(by = cluster)
+  
+
+# write significant ISGs to file
+sig_ISG_list %>%
+  write.table(file="output/sigISGs_MA10PR8vs_PR8.tsv", quote=FALSE, sep='\t', row.names = F)
+
+# scale data in RNA assay (not done before)
+DefaultAssay(BALF_combined) <- "RNA"
+BALF_combined <- ScaleData(BALF_combined, verbose = FALSE)
+Idents(BALF_combined) <-"minor_group"
+
+# generate heatmap of all ISGs that are significant in any cluster
+DoHeatmap(subset(BALF_combined, downsample =50), features = sig_ISG_list$gene, size = 2) +
+  theme(text = element_text(size=4), plot.title = element_text(size = 10,vjust=4)) +
+  ggtitle("Significant ISGs in any cluster")
+ggsave(file="output/ISG_analyses/sigISG_heatmap.pdf")
+
+# plot violin plots with top10 significantly regulated ISGs per cluster
+# only significant genes up to cluster 8
+Idents(BALF_combined) <-  "minor_group"
+
+number_of_clusters = 14
+
+for(j in 1:number_of_clusters){
+  cluster_of_interest = as.character(j)
+  top10_ISGs <- sig_ISG_list %>%
+    filter(cluster == cluster_of_interest) %>%
+    slice_max(n = 10, order_by = -p_val_adj)
+  top10_ISGs <- top10_ISGs$gene
+  if(length(top10_ISGs > 0)){
+    plotlist <- list()
+    for(i in 1:length(top10_ISGs)){
+      p1 <- VlnPlot(BALF_combined, features = top10_ISGs[[i]], split.by = "group", idents = cellTypeTable[j,1], group.by = "minor_group",
+              pt.size = 0, combine = T) 
+      p2 <- p1 + stat_compare_means(method = "wilcox.test", aes(label=..p.adj..)) + theme(aspect.ratio = 1) #+ stat_compare_means(label = "p.signif") 
+      plotlist[[top10_ISGs[[i]]]] <- p2
+      ggsave(p2, file=paste0("output/ISG_analyses/top10ISGs_violin_plot/cluster_",cluster_of_interest,"_",cellTypeTable[j,1],"_",as.character(top10_ISGs[[i]]),".pdf"),dpi = 300, units = c("cm"),width = 30, height = 30)
+  }}
+  print(paste0("cluster_",cluster_of_interest," done!"))
+  plotlist
+  }
+
+#--------------------------------------------------------------------
+# IAV GENE EXPRESSION ANALYSES
+#--------------------------------------------------------------------
+# identify clusters that express selected IAV transcripts
+iav_genes <- c("+PB2", "+PA", "+PB-1", "+NEP", "+NS1", "+NP", "+NA", "+HA", "+M2", "+M1")
+   
+for(i in 1:length(iav_genes)){
+  p1 <- VlnPlot(BALF_combined, features = iav_genes[[i]], split.by = "group", group.by = "minor_group",
+              pt.size = 0, combine = T)
+  ggsave(p1, file=paste0("output/IAV_genes_violin_plot/IAV_gene","_",iav_genes[[i]],".pdf"),dpi = 300, units = c("cm"),width = 30, height = 30)
+}
+
+#--------------------------------------------------------------------
+# GENES of INTEREST EXPRESSION ANALYSES
+#--------------------------------------------------------------------
+# identify clusters that express selected IAV transcripts
+genesOI <- c("Ifit1", "Irf9", "Irf7", "Ccl2", "Ccl5","Spp1")
+
+for(i in 1:length(genesOI)){
+  p1 <- VlnPlot(BALF_combined, features = genesOI[[i]], split.by = "group", group.by = "minor_group",
+                pt.size = 0, combine = T)
+  ggsave(p1, file=paste0("output/genesOI_violin_plot/geneOI","_",genesOI[[i]],".pdf"),dpi = 300, units = c("cm"),width = 30, height = 30)
+}
+  
+#--------------------------------------------------------------------
+# APPENDIX
+#--------------------------------------------------------------------
+# which R packages and versions?
+if ("devtools" %in% installed.packages()) devtools::session_info()
+
+```
+
