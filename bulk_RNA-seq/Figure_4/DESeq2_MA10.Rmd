@@ -1,0 +1,294 @@
+---
+title: "XR090_heatmap_fpkm_filter"
+author: "Alexander Lercher"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+#--------------------------------------------------------------------
+# LOAD PACKAGES
+#--------------------------------------------------------------------
+library(tidyr)
+library(dplyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(gplots)
+library(RColorBrewer)
+library(DESeq2)
+
+
+#--------------------------------------------------------------------
+# DATA IMPORT AND CLEANUP
+#--------------------------------------------------------------------
+# import table with reads of all samples
+data <- read.delim("input/XR090_all_samples_merged.csv")
+
+# remove read statistics from data file
+data_raw <- data[5:length(rownames(data)),]
+
+# make gene names row names and remove gene column
+row.names(data_raw) <- data_raw$gene
+data_raw$gene <- NULL
+rm(data)
+
+
+#--------------------------------------------------------------------
+# IMPORT METADATA AND COMPARISONS OF INTEREST
+#--------------------------------------------------------------------
+# import table with metadata of all samples
+metadata <- read.table("input/metadata.txt", header = T)
+
+# import table with groups you want to compare with
+# add column with comparison name
+# add column with comparison number
+DE_groups <- read.table("input/group_comparisons.txt", header = T)
+
+comparison_name <- list()
+comparison_number <- list()
+for(i in 1:nrow(DE_groups)){
+  x <- paste0(DE_groups[i,1],"_vs_",DE_groups[i,2])
+  comparison_name[[i]] <- x
+  comparison_number[[i]] <- i
+}
+DE_groups$Comparison <- comparison_name
+DE_groups$ComparisonNumber <- comparison_number
+rm(comparison_name, comparison_number)
+
+#--------------------------------------------------------------------
+# RUN DESeq2
+#--------------------------------------------------------------------
+# DESeq analyses and create DESeq object
+dds <- DESeqDataSetFromMatrix(countData = as.matrix(data_raw),
+                              colData = metadata,
+                              design = ~ description)
+dds <- DESeq(dds)
+
+
+#--------------------------------------------------------------------
+# FILTER OUT GENES WITH LESS THAN THRESHOLD COUNT ACROSS ALL CONDITIONS
+#--------------------------------------------------------------------
+threshold_count <- 10
+keep <- rowSums(counts(dds)) >= threshold_count
+head(keep)
+dds <- dds[keep,]
+rm(threshold_count, keep)
+
+
+#--------------------------------------------------------------------
+# EXAMINE DESeq2 RESULTS
+#--------------------------------------------------------------------
+# calculated correction factors and dispersion plot
+as.data.frame(sizeFactors(dds))
+plotDispEsts(dds,
+             genecol = "darkgray",
+             fitcol = "black",
+             finalcol = "tomato3")
+
+
+#--------------------------------------------------------------------
+# SAMPLE DISTANCE PLOTS
+#--------------------------------------------------------------------
+# do sample distance plot for MA10 conditions only
+sampleDistMatrix_MA10 <- sampleDistMatrix[grepl("MA10", rownames(sampleDistMatrix)),grepl("MA10", colnames(sampleDistMatrix))]
+heatmap.2(sampleDistMatrix_MA10, trace = "none", col = colors, cexRow = 0.7, cexCol = 0.7,main = "MA10 sample to sample distances")
+
+
+#--------------------------------------------------------------------
+# PCA PLOTS
+#--------------------------------------------------------------------
+# do PCA plot for MA10 conditions only
+MA10_conditions <- metadata %>%
+  dplyr::select(description) %>%
+  distinct(description) %>%
+  filter(str_detect(description, "MA10"))
+MA10_conditions <- as.character(MA10_conditions$description)
+
+vsdata_MA10 <- vsdata[, vsdata$description %in% c(MA10_conditions)]
+plotPCA(vsdata_MA10, intgroup = "description") + 
+  scale_color_brewer(palette = "Spectral") + 
+  theme_bw() + 
+  ggtitle(paste0("PCA plot of MA10 samples")) +
+  theme(aspect.ratio = 1)
+
+
+#--------------------------------------------------------------------
+# GET DESeq2 RESULTS FOR COMPARISONS OF INTEREST
+#--------------------------------------------------------------------
+# generate function to generate output files for comparisons of interest
+deseq_all_comparisons <- function(deseq_data,pval_cutoff) {
+  datalist = list()
+  
+  for (i in 1:nrow(DE_groups)){
+    numerator <- DE_groups[[i,1]]
+    denominator <- DE_groups[[i,2]]
+    
+    #Get results from specific contrasts
+    results_contrast <- results(deseq_data, contrast = c("description", numerator, denominator))
+    results_contrast_wo_na=results_contrast[!is.na(results_contrast$pvalue),]
+    results_contrast_wo_na$gene_id=rownames(results_contrast_wo_na)
+    results_contrast_sign=results_contrast_wo_na[results_contrast_wo_na$pvalue<=pval_cutoff,]
+    results_contrast_sign$comparison=i
+    datalist[[i]]=results_contrast_sign
+  }
+  big_data = do.call(rbind, datalist)
+  return(big_data)
+}
+
+# generate file with comparisons of interest
+pval_cutoff = 1
+results <- deseq_all_comparisons(dds,pval_cutoff)
+
+head(results(dds, tidy=TRUE))
+summary(results)
+
+# fact check that number of comparisons in DESeq2 output is same as comparisons of interest in input file
+length(unique(data.frame(results)$comparison)) == nrow(DE_groups)
+
+# generate table with comparison names
+mycomparison_names <- DE_groups %>%
+  dplyr::select(ComparisonNumber, Comparison) %>%
+  dplyr::rename(comparison = ComparisonNumber,
+                comparison_name = Comparison) %>%
+  print()
+
+
+#--------------------------------------------------------------------
+# WRITE DESeq2 RESULTS TO FILE
+#--------------------------------------------------------------------
+# filter for genes with p-value cutoff of choice
+padj_cutoff = 1
+results_cutoff <- subset(results, results$padj <= padj_cutoff)
+
+# save these results as data frame and add information on comparisons
+df_results <- data.frame(results_cutoff)
+df_results <-  merge(df_results,mycomparison_names, by=c("comparison"))
+
+# save each comparison as separate data frames
+comparisons_list <- list()
+for(i in 1:length(unique(df_results$comparison))){
+  x <- subset(df_results,df_results$comparison == i)
+  y <- filter(mycomparison_names, comparison == i)
+  y <- y$comparison_name
+  x$comparison_name <- NULL
+  x$comparison_name <- as.character(y)
+  comparisons_list[[paste0(i,"_",y)]] <- x
+  rm(x,y)
+}
+
+for(i in 1:length(comparisons_list)){
+  write_tsv(comparisons_list[[i]], paste0("output/",names(comparisons_list)[[i]],"_DEG.tsv"))
+}
+
+#--------------------------------------------------------------------
+# GET FPM/CPM, CLEAN UP TABLE AND WRITE TO FILE
+#--------------------------------------------------------------------
+# get fpm/cpm from dds
+data_cpm <- fpm(dds)
+data_cpm <- as.data.frame(data_cpm)
+data_cpm$gene <- rownames(data_cpm)
+data_cpm  <- data_cpm %>%
+  dplyr::select(gene, everything())
+
+# import new col names for data
+colnames_data <- read.delim("input/col_names_data.tsv")
+
+# check whether old col name order is correct
+colnames(data_cpm) == colnames_data$colnames_old
+
+# rename data with new colnames
+colnames(data_cpm) <- colnames_data$colnames_new
+
+# order columns
+data_cpm <- data_cpm %>%
+  dplyr::select(order(colnames(data_cpm)))
+
+# save cpm to file
+write_tsv(data_cpm, "output/XR090_CPM.tsv")
+
+#--------------------------------------------------------------------
+# GET FPKM FROM DDS, CLEAN UP TABLE AND WRITE TO FILE
+#--------------------------------------------------------------------
+# get gene order from dds object
+dds_gene_order <- data.frame(SYMBOL = rownames(dds))
+
+# get transcript lengths (actual transcript, not genomic length)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+transcriptLengths <- transcriptLengths(TxDb.Mmusculus.UCSC.mm10.knownGene)
+# rename gene_id column to ENTREZID
+transcriptLengths <- transcriptLengths %>%
+  dplyr::rename(ENTREZID = gene_id)
+
+# get ENTREZID and SYMBOLS from all genes
+library(org.Mm.eg.db)
+mm <- org.Mm.eg.db
+my.geneID <- unique(transcriptLengths$ENTREZID)
+gene_list_geneID <- AnnotationDbi::select(mm, 
+                                          keys = my.geneID,
+                                          columns = c("ENTREZID", "SYMBOL"),
+                                          keytype = "ENTREZID")
+
+# merge all transcript lengths to all genes
+transcriptLengths <- left_join(gene_list_geneID, transcriptLengths)
+
+# only keep longest transcript in case some genes have multiple transcripts
+longestTranscripts <- transcriptLengths %>%
+  na.omit() %>%
+  group_by(ENTREZID) %>%
+  arrange(desc(tx_len)) %>%
+  slice_head()
+
+# merge transcript lengths with genes from dds object (order will be kept)
+dds_gene_order_length <- left_join(dds_gene_order,longestTranscripts)
+# check whether order of SYMBOLS of new table is the same as original DDS object
+summary(dds_gene_order$SYMBOL == dds_gene_order_length$SYMBOL)
+
+# define basepairs vector
+basepairs <- as.vector(dds_gene_order_length$tx_len)
+
+# add basepairs vector to DDS object
+mcols(dds)$basepairs <- basepairs
+
+# calculate FPKMs and omit NA (genes with no annotated transcript length)
+data_fpkm <- fpkm(dds)
+data_fpkm <- na.omit(data_fpkm)
+data_fpkm <- as.data.frame(data_fpkm)
+data_fpkm$gene <- rownames(data_fpkm)
+data_fpkm  <- data_fpkm %>%
+  dplyr::select(gene, everything())
+
+# import new col names for data
+colnames_data <- read.delim("input/col_names_data.tsv")
+
+# check whether old col name order is correct
+colnames(data_fpkm) == colnames_data$colnames_old
+
+# rename data with new colnames
+colnames(data_fpkm) <- colnames_data$colnames_new
+
+# order columns
+data_fpkm <- data_fpkm %>%
+  dplyr::select(order(colnames(data_fpkm)))
+
+# save FPKM to file
+write_tsv(data_fpkm, "output/XR090_FPKM.tsv")
+
+
+# which R packages and versions?
+if ("devtools" %in% installed.packages()) devtools::session_info()
+
+
+
+```
+

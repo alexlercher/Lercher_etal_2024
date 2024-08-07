@@ -1,0 +1,119 @@
+---
+title: "XR090_heatmap_fpkm_filter"
+author: "Alexander Lercher"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+#--------------------------------------------------------------------
+# LOAD PACKAGES
+#--------------------------------------------------------------------
+library(readr)
+library(tidyverse)
+library(dplyr)
+library(clusterProfiler)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+library(org.Mm.eg.db)
+library(DOSE)  
+library(enrichplot)
+library(clusterProfiler)
+library(viridis)
+
+
+#--------------------------------------------------------------------
+# DATA IMPORT AND CLEANUP
+#--------------------------------------------------------------------
+# import significant DEG in at least one MA10 comparison
+data_all_MA10 <- read.delim("output/fpkm_filter/all_MA10_DEG_cluster_fpkm_filter_6clusters.tsv")
+
+# group data (genes) by cluster
+# remove duplicate genes (some genes significant across mult comparisons)
+data_unique <- data_all_MA10 %>%
+  arrange(cluster) %>%
+  group_by(cluster) %>%
+  arrange(log2FoldChange) %>%
+  distinct(gene_id, .keep_all = TRUE) %>%
+  dplyr::rename(SYMBOL = gene_id) %>%
+  arrange(cluster)
+
+
+#--------------------------------------------------------------------
+# PRINT TOP 10 MARKER GENES PER CLUSTER
+#--------------------------------------------------------------------
+# identify top 10 marker genes per cluster
+top10_markers_MA10_cluster <- data_unique %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = log2FoldChange) %>%
+  arrange(cluster) %>%
+  dplyr::select(cluster,SYMBOL) %>%
+  print(n=50)
+
+
+#--------------------------------------------------------------------
+# CONVERT GENE SYMBOLS TO ENTREZID
+#--------------------------------------------------------------------
+# for enrichment analyses, add ENTREZID to SYMBOL
+mm <- org.Mm.eg.db
+my.symbols <- unique(data_unique$SYMBOL)
+gene_list_ENTREZID <- AnnotationDbi::select(mm, 
+                                            keys = my.symbols,
+                                            columns = c("ENTREZID", "SYMBOL"),
+                                            keytype = "SYMBOL")
+
+colnames(gene_list_ENTREZID) <- c("SYMBOL","ENTREZID")
+
+data_unique <- left_join(data_unique,gene_list_ENTREZID)
+
+
+#--------------------------------------------------------------------
+# RUN GO ENRICHMENT for clusters
+#--------------------------------------------------------------------
+# GO enrichment analyses
+# note there might be too few cells for GO enrichment in some clusters
+number_of_clusters = list("1","2","6")
+min_GO_pval <- 0.001
+
+GO_plot_list <- list()
+for(i in 1:length(number_of_clusters)){
+  clusterOI <- number_of_clusters[[i]]
+  clusterOI <- as.numeric(clusterOI)
+  genes_of_cluster <- data_unique %>%
+    filter(cluster == as.character(clusterOI)) %>%
+    dplyr::select(ENTREZID) %>%
+    dplyr::rename(genes = ENTREZID)
+  
+  yy <- compareCluster(geneCluster   = genes_of_cluster,
+                       fun           = "enrichGO",
+                       pvalueCutoff  = min_GO_pval,
+                       pAdjustMethod = "BH", 
+                       OrgDb = org.Mm.eg.db, 
+                       ont = 'BP')
+  yy <- pairwise_termsim(yy)
+  write_tsv(yy@compareClusterResult, paste0("output/fpkm_filter/GO_enrichment_cluster_",clusterOI,"_fpkm_filter_6clusters.tsv"))
+  p2 <- emapplot(yy, pie="count", min.edge=0.3, cex_category=2, cex_line=0.5, cex_label_category=1.5, layout = "nicely", repel = T) +
+    ggtitle(paste0("GO Enrichment Network of cluster ",clusterOI)) +
+    theme(aspect.ratio = 1,plot.title = element_text(size=10)) + 
+    scale_color_viridis(option = "plasma", direction = -1)
+  GO_plot_list[[paste0("cluster_",clusterOI)]] <- p2
+  ggsave(p2, file=paste0("output/fpkm_filter/GO_enrichment_cluster_",clusterOI,"_fpkm_filter_6clusters.pdf"),dpi = 300, units = c("cm"),width = 30, height = 30)
+  print(paste0("cluster_",clusterOI," done!"))
+  #rm(genes_of_cluster,yy,p2)
+}
+GO_plot_list
+
+# which R packages and versions?
+if ("devtools" %in% installed.packages()) devtools::session_info()
+
+```
+
