@@ -1,0 +1,929 @@
+---
+title: "Influence of SARS-CoV-2 exposure on response to IAV infection"
+author:
+  - Emma DeGrace^[Icahn School of Medicine at Mount Sinai, emma.degrace@icahn.mssm.edu]
+  - Alexander Lercher^[The Rockefeller University, alercher@rockefeller.edu]
+  - Charles Rice^[The Rockefeller University, ricec@rockefeller.edu]
+  - Brad Rosenberg^[Icahn School of Medicine at Mount Sinai, brad.rosenberg@mssm.edu]
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+    bookdown::html_document2:
+      toc: true
+      toc_float: true
+      fig_caption: yes
+      code_folding: hide
+---
+
+```{r setup, echo = FALSE}
+knitr::opts_chunk$set(
+  collapse = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  error = FALSE,
+  fig.path = "../figures/",
+  comment = "",
+  dpi = 300
+)
+r_version <- "4.0.3"
+if (r_version == paste0(R.Version()$major,
+  sep = ".",
+  R.Version()$minor
+)) {
+  print(paste(
+    "Running R Version",
+    r_version
+  ))
+} else {
+  print(paste(
+    "To ensure reproducibility, please use R Version",
+    r_version
+  ))
+}
+```
+
+```{r libaries, echo=FALSE, results='hide'}
+# Load required libraries
+library(ape)
+library(biomaRt)
+library(cli)
+library(clustree)
+library(data.table)
+library(dplyr)
+library(edgeR)
+library(egg)
+library(forcats)
+library(future)
+library(ggplot2)
+library(ggpubr)
+library(ggsci)
+library(knitr)
+library(Matrix)
+library(markdown)
+library(metap)
+library(multtest)
+library(openxlsx)
+library(pals)
+library(patchwork)
+library(purrr)
+library(RColorBrewer)
+library(rmarkdown)
+library(reshape2)
+library(rlang)
+library(scales)
+library(scDblFinder)
+library(Seurat)
+library(SeuratObject)
+library(SingleCellExperiment)
+library(SingleR)
+library(stringr)
+```
+
+```{r set-paths, echo=FALSE, results='hide'}
+# Set RNG seed
+set.seed(123)
+
+# Set file paths
+path_fig <- here::here("analysis/figures/")
+path_rawdata <- here::here("analysis/data/raw_data/")
+path_deriveddata <- here::here("analysis/data/derived_data/")
+path_supportingdata <- here::here("analysis/data/raw_data/supporting_data/")
+
+# Add directories not a part of git
+if (dir.exists(path_fig) == FALSE) {
+  dir.create(here::here("analysis/figures/"))
+}
+if (dir.exists(path_deriveddata) == FALSE) {
+  dir.create(here::here("analysis/data/derived_data/"))
+}
+
+# Set parallelization information
+ncores <- 4
+plan("multisession", workers = ncores)
+options(future.globals.maxSize = 20 * 1024^3) # 20GB
+```
+
+```{r source-R-functions, echo=FALSE}
+# Source in R functions
+source(here::here("R/ggplot_shortcuts.R")) 
+source(here::here("R/load_viral_genes.R")) 
+source(here::here("R/subset_cluster_annotation.R"))
+source(here::here("R/buildmasterannotation.R"))
+```
+
+# Analysis of single-cell RNA sequencing data
+
+## Data processing
+
+### Read alignment and quantification 
+NextSeq BCL sequencing files were converted to fastq files using the 10X `CellRanger`v5.0.0 `mkfastq` tool, with `bash/submit_mkfastq.sh` script. 
+
+`Cufflinks v2.2.0` helper scripts were used to convert the [NCBI SARSCoV2-MA10-MT952602-1.gff3 reference](https://www.ncbi.nlm.nih.gov/nuccore/MT952602.1/) file to the required gtf file format, as described in the `bash/gff2gtf.sh` script.
+
+Three separate references (mouse mm10 transcriptome, SARS-CoV-2 MA10 transcriptome, and IAV PR8 transcriptome) were combined into one joint reference transcriptome using the `mkref` tool from `CellRanger`v5.0.0, as described in the `bash/mk_Ms-PR8-SARSCoV2MA10_ref.lsf` script.
+
+Using the joint reference transcriptome, fastq transcript counts were quantified using the `CellRanger`v5.0.0 `count` tool, as described in the `bash/submit_count.sh` script.
+
+### Data import
+
+Filtered `CellRanger` counts matrices were imported to a Seurat object. 
+
+```{r get-data}
+runs10X <- rownames(cellranger_qc)
+names(runs10X) <- c("Mock|IAV", "SARSCoV2|IAV")
+
+# Source of potential artifacts (DOI: 10.1101/gr.253880.119,  DOI: 10.1038/s41385-019-0220-y, DOI: 10.1016/j.isci.2020.101582)
+features_to_remove <- c("Gm42418", "Gm26917", "AY036118")
+
+# Read in 10X gene-cell matrices
+balf_list <- lapply(runs10X, function(x){
+  data_10X <- Read10X(
+    data.dir = paste0(path_rawdata, x, "_10X/outs/filtered_feature_bc_matrix/")
+    )
+  # Remove artifact features
+  data_10X <- data_10X[!(rownames(data_10X) %in% features_to_remove), ]
+  # Create Seurat object with GEX data processed by CellRanger 5.0.0
+  seurat <- CreateSeuratObject(
+    counts = data_10X,
+    project = x,
+    min.cells = 0
+    )
+  seurat@meta.data$group <- names(which(runs10X == x))
+  return(seurat)
+})
+names(balf_list) <- runs10X
+```
+
+### Quality contol
+
+#### Set quality contol filters
+
+```{r set-qc-cutoffs}
+# Set quality control cutoffs
+min_umi <- 500
+max_umi <- 20000
+max_mt_pct <- 10
+max_mt_frc <- 10
+```
+
+```{r calc-percent-features}
+# Calculate percent mitochondrial gene expression
+balf_list <- lapply(balf_list, function(x) {
+  x <- PercentageFeatureSet(x, pattern = "^mt-", col.name = "percent.mt")
+})
+
+# Add nCount metadata of host transcripts only
+# Split IAV genes by strand
+neg_strand <- grep(iav_genes, pattern = "^-", value = TRUE)
+pos_strand <- grep(iav_genes, pattern = "^-", value = TRUE, invert = TRUE)
+
+balf_list <- lapply(balf_list, function(x) {
+  host_genes <- rownames(x)[!rownames(x) %in% c(iav_genes, sars_genes)]
+  x <- AddMetaData(x,
+    metadata = c(Matrix::colSums(x@assays$RNA@counts[host_genes, ])),
+    col.name = "nCount_RNA_host"
+  )
+  return(x)
+})
+
+# Add percent exprs metadata of host transcripts only
+balf_list <- lapply(balf_list, function(x) {
+  genes_in_object <- grep(pattern = "^mt-", x = rownames(x), value = TRUE)
+  host_genes <- rownames(x)[!rownames(x) %in% c(iav_genes, sars_genes)]
+  x <- AddMetaData(
+    x, metadata = c(Matrix::colSums(x@assays$RNA@counts[genes_in_object, ]) / 
+                      Matrix::colSums(x@assays$RNA@counts[host_genes, ])) * 100,
+    col.name = "fraction_mito_host"
+  )
+  return(x)
+})
+```
+
+```{r Filter low quality cells, message=FALSE, warning=FALSE}
+balf_list <- lapply(balf_list, function(x){
+  subset(x, fraction_mito_host < max_mt_frc & nCount_RNA > min_umi)
+  })
+```
+
+#### Putative doublet filtering
+
+```{r scDblFinder}
+balf_list <- lapply(balf_list, function(x) {
+  # Convert object to format required for scDblFinder
+  sce <- as.SingleCellExperiment(x, assay = "RNA")
+  # Run scDblFinder
+  sce <- scDblFinder(sce = sce, clusters = NULL, dims = 30, verbose = FALSE)
+  # Add back annotations to Seurat metadata
+  df_metadata <- as.data.frame(
+    colData(sce)[,c("scDblFinder.class", "scDblFinder.score", 
+                    "scDblFinder.weighted", "scDblFinder.cxds_score")]
+    )
+  x <- AddMetaData(x, metadata = df_metadata)
+
+  # Print cell counts per classification
+  print(unique(x$group))
+  print(table(x$scDblFinder.class))
+  return(x)
+})
+```
+
+```{r putative doublet filter}
+balf_list <- lapply(balf_list, function(x) {
+  Idents(x) <- "scDblFinder.class"
+  x <- subset(x, idents = "singlet")
+  x <- subset(x, nCount_RNA < max_umi)
+  return(x)
+})
+```
+
+#### Putative erythrocyte filtering
+
+```{r}
+max_hb_pct <- 75
+
+balf_list <- lapply(balf_list, function(x) {
+  x <- PercentageFeatureSet(x, pattern = "^Hb[ab]", col.name = "percent.hb")
+})
+
+balf_list <- lapply(balf_list, function(x) {
+  x <- subset(x, percent.hb < max_hb_pct)
+  return(x)
+})
+```
+
+### Cell cycle scoring
+
+Cell cycle genesets defined by [Tirosh et al (2019)](https://doi.org/10.1126/science.aad0501) converted to mouse genes, as described in `convertHumanGeneList.R`.
+
+```{r cell-cycle-scoring}
+# Add cell cycle scores and difference as described - 
+# https://satijalab.org/seurat/archive/v3.1/cell_cycle_vignette.html
+# Load MOUSE cell cycle genes
+load(here::here(
+  "analysis/data/raw_data/supporting_data/mm_cellcycle_genes.rdata")
+  )
+balf_list <- lapply(balf_list, function(x){
+  # Cell cycle scoring
+  x <- NormalizeData(x, assay = "RNA")
+  x <- CellCycleScoring(x, s.features = m.s.genes, g2m.features = m.g2m.genes)
+  x$CC.Difference <- x$S.Score - x$G2M.Score
+  return(x)
+})
+```
+
+### IAV and SARS-CoV-2 transcript detection
+
+```{r viral-trxn-scoring}
+# Add percent exprs metadata for viral gene expression
+balf_list <- lapply(balf_list, function(x) {
+  DefaultAssay(x) <- "RNA"
+  x <- PercentageFeatureSet(
+    x, features = as.character(iav_genes), col.name = "percent_iav"
+    )
+  x <- PercentageFeatureSet(
+    x, features = as.character(neg_strand), col.name = "percent_iav_neg"
+    )
+  x <- PercentageFeatureSet(
+    x, features = as.character(pos_strand),col.name = "percent_iav_pos"
+    )
+})
+
+# Add total viral UMIs to metadata
+balf_list <- lapply(balf_list, function(x) {
+  # UMI counts aligned to SARS genes
+  genes_in_object <- sars_genes[sars_genes %in% rownames(x@assays$RNA)]
+  x <- AddMetaData(x,
+    metadata = Matrix::colSums(x@assays$RNA@counts[genes_in_object, ]),
+    col.name = "nCount_sars"
+  )
+
+  # UMI counts aligned to IAV genes, pos or neg strand
+  genes_in_object <- iav_genes[iav_genes %in% rownames(x@assays$RNA)]
+  x <- AddMetaData(x,
+    metadata = Matrix::colSums(x@assays$RNA@counts[genes_in_object, ]),
+    col.name = "nCount_iav"
+  )
+  genes_in_object <- neg_strand[neg_strand %in% rownames(x@assays$RNA)]
+  x <- AddMetaData(x,
+    metadata = Matrix::colSums(x@assays$RNA@counts[genes_in_object, ]),
+    col.name = "nCount_iav_neg"
+  )
+  genes_in_object <- pos_strand[pos_strand %in% rownames(x@assays$RNA)]
+  x <- AddMetaData(x,
+    metadata = Matrix::colSums(x@assays$RNA@counts[genes_in_object, ]),
+    col.name = "nCount_iav_pos"
+  )
+  return(x)
+})
+```
+
+## Data analysis
+
+### Sample dataset integration 
+
+```{r}
+# Merge both objects
+balf_merged <- merge(balf_list[[1]], balf_list[[2]])
+# Collect TCR and BCR VDJ genes to avoid artificial clustering of B/T
+tcr_segments <- c("^Trav", "^Traj", "^Trbv", "^Trbd", "^Trbj", 
+                  "^Trgv", "^Trgj", "^Trdv", "^Trdd", "^Trdj")
+
+bcr_segments <- c("^Ighv", "^Ighd", "^Ighj", "Igkv", "^Igkj", "^Iglv", "^Iglj")
+
+patternmatch <- paste(c(tcr_segments, bcr_segments), collapse = "|")
+vdj_genes <- grep(pattern = patternmatch, x = rownames(balf_merged), value = T )
+```
+
+```{r integrate-datasets, results='hide'}
+# Run SCtransform on each data set
+balf_list <- lapply(X = balf_list, FUN = function(x) {
+  x <- SCTransform(x,
+    vars.to.regress = c("fraction_mito_host", "CC.Difference"),
+    return.only.var.genes = FALSE,
+    verbose = FALSE
+  )
+})
+
+# Integrate samples to single object for clustering
+balf_features <- SelectIntegrationFeatures(object.list = balf_list, 
+                                           nfeatures = 3000)
+balf_features <- balf_features[!balf_features %in% c(iav_genes, vdj_genes)]
+
+balf_list <- PrepSCTIntegration(
+  object.list = balf_list,
+  anchor.features = balf_features,
+  verbose = FALSE
+)
+balf_anchors <- FindIntegrationAnchors(
+  object.list = balf_list,
+  normalization.method = "SCT",
+  anchor.features = balf_features,
+  verbose = FALSE
+)
+balf_integrated <- IntegrateData(
+  anchorset = balf_anchors,
+  normalization.method = "SCT",
+  verbose = FALSE
+)
+
+# Normalize RNA slot for downstream visualization
+balf_integrated <- NormalizeData(balf_integrated, assay = "RNA")
+
+# Clean up from integration
+rm(balf_features, balf_anchors, balf_merged)
+```
+
+### PCA dimensional reduction
+
+```{r integrated-dim-reduction}
+# Run PCA/UMAP on integrated data
+DefaultAssay(balf_integrated) <- "integrated"
+features <- balf_integrated@assays$integrated@var.features
+
+balf_integrated <- RunPCA(
+  balf_integrated,
+  features = features[!features %in% c(iav_genes, vdj_genes)],
+  npcs = 100,
+  verbose = FALSE, 
+)
+
+ndims <- 60
+
+balf_integrated <- RunUMAP(balf_integrated,
+                           reduction = "pca",
+                           dims = 1:ndims,
+                           verbose = FALSE
+                           ) %>% 
+  FindNeighbors(reduction = "pca", dims = 1:ndims, verbose = FALSE)
+```
+
+### Integrated clustering
+
+```{r integrated-clustree}
+DefaultAssay(balf_integrated) <- "integrated"
+balf_integrated <- FindClusters(
+  balf_integrated,
+  resolution = seq(from = 0.2, to = 6.0, by = 0.2),
+  verbose = FALSE
+)
+ref_res <- 2.6
+balf_integrated <- SetIdent(
+  balf_integrated,
+  value = paste0("integrated_snn_res.", ref_res)
+)
+balf_integrated <- AddMetaData(
+  object = balf_integrated,
+  metadata = Idents(balf_integrated),
+  col.name = "seurat_clusters"
+)
+```
+
+### Assess clusters for QC
+
+```{r integrated initial clusters dge}
+Idents(balf_integrated) <- "seurat_clusters"
+clusters_to_test <- levels(balf_integrated$seurat_clusters)
+cluster_markers <- lapply(clusters_to_test, function(x){
+  FindConservedMarkers(balf_integrated,
+                       ident.1 = x,
+                       assay = "RNA",
+                       only.pos = TRUE,
+                       grouping.var = "group"
+                       )
+  })
+names(cluster_markers) <- clusters_to_test
+```
+
+```{r Cell cycle scoring to identify proliferation clusters}
+# Identify proliferating clusters
+score_threshold <- 0.1
+proliferatingclusters <- 
+  balf_integrated@meta.data %>%
+  group_by(seurat_clusters) %>%
+  summarise(meanS = mean(S.Score), meanG2M = mean(G2M.Score)) %>%
+  filter(meanS > score_threshold & meanG2M > score_threshold) %>%
+  pull(seurat_clusters) %>%
+  as.character()
+```
+
+```{r ptprc expression for epithelial cell clusters}
+# Identify epithelial cell clusters
+avgexp_ptprc <- AverageExpression(balf_integrated,
+                                  assays = "RNA", features = "Ptprc")
+threshold_ptprc <- 2
+epithelial_clusters <- names(
+  avgexp_ptprc$RNA[, avgexp_ptprc$RNA < threshold_ptprc]
+  )
+```
+
+### SingleR classification to identify major cell type groups
+
+```{r SingleR cluster mode}
+# Integration, so use raw counts as recommended by developers
+mat <- GetAssayData(balf_integrated, assay = "RNA", slot = "counts")
+mat <- as.matrix(mat)
+
+# Pull ImmGen references
+ref_ImmGen <- celldex::ImmGenData()
+
+## SingleR ImmGen MAIN labels
+## CLUSTER mode
+predictions_main <- SingleR(
+  test = mat,
+  ref = ref_ImmGen,
+  labels = ref_ImmGen$label.main,
+  clusters = balf_integrated$seurat_clusters
+  )
+df_predictions <- as.data.frame(predictions_main[,c("labels", "pruned.labels")])
+df_predictions$cluster <- rownames(df_predictions)
+
+# Construct cell level data frame
+df_metadata <- balf_integrated@meta.data
+df_metadata$cell_barcode <- rownames(df_metadata)
+df_metadata <- merge(
+    x = df_metadata,
+    y = df_predictions,
+    by.x = "seurat_clusters",
+    by.y = "cluster",
+    all.x = TRUE
+    )
+rownames(df_metadata) <- df_metadata$cell_barcode
+  
+# Add to Seurat object
+balf_integrated <- AddMetaData(
+  balf_integrated, metadata = df_metadata[,c("labels", "pruned.labels")],
+  col.name = c("cluster.labels.main",
+               "cluster.pruned.labels.main")
+  )
+```
+
+```{r Split proliferating cells to appropriate major cell group}
+# Add major cell group to seurat metadata
+balf_integrated$singler_main <- balf_integrated$cluster.labels.main
+# For proliferating cells, SingleR in SINGLE CELL MODE with ImmGen MAIN labels
+Idents(balf_integrated) <- "seurat_clusters"
+proliferating_cells <- WhichCells(balf_integrated, 
+                                  idents = proliferatingclusters
+                                  )
+## Raw counts recommended by SingleR developers
+## SingleR ImmGen MAIN Labels
+proliferating_predictions_main <- SingleR(
+  test = mat[,proliferating_cells],
+  ref = ref_ImmGen,
+  labels = ref_ImmGen$label.main
+  )
+
+# For proliferating cells only, replace main cell group label with
+# cell group label identified in SINGLE CELL MODE
+balf_integrated$singler_main[proliferating_cells] <-
+  proliferating_predictions_main[proliferating_cells, "labels"]
+
+# For epithelial cells, replace main cell group label
+## Not necessarily represented in ImmGen reference!
+Idents(balf_integrated) <- "seurat_clusters"
+epithelial_cells <- WhichCells(balf_integrated, 
+                                  idents = epithelial_clusters
+                                  )
+balf_integrated$singler_main[epithelial_cells] <- "Epithelial cells"
+```
+
+```{r Major cell group UMAP}
+# Cells are assigned to *major cell groups* based on SingleR ImmGen "main" annotation labels
+Idents(balf_integrated) <- "singler_main"
+
+# Define major cell groups based on SingleR "main" labels
+major_cell_groups <- list(
+  Tcell = c("T cells", "NKT", "Tgd"),
+  Bcell = c("B cells"),
+  NKILC = c("NK cells", "ILC"),
+  MonocyteMacrophage = c("Monocytes", "Macrophages"),
+  DC = "DC",
+  Neutrophil = c("Neutrophils"),
+  Nonimmune = c("Epithelial cells", "Fibroblasts", "Stromal cells",
+                "Microglia", "Stem cells")
+)
+```
+
+## Major cell group subpopulation annotation
+
+### T cell major group
+
+```{r T cell major cell group annotations}
+Idents(balf_integrated) <- "singler_main"
+group_to_test <- "Tcell"
+
+# Subset to T cell major cell group, re-run PCA, and re-run clustering
+group_subset <- subset_major_group(balf_integrated,
+                                   group_to_test = group_to_test
+                                   )
+ndims <- 100 # From data exploration
+group_subset <- determine_cluster_res(group_subset,
+                                      ndims = ndims, maxres = 4)
+cluster_res <- 2.2
+group_subset[["subset_clusters"]] <- 
+  group_subset@meta.data[,paste0("integrated_snn_res.", cluster_res)]
+
+# Remove low UMI clusters
+Idents(group_subset) <- "subset_clusters"
+low_umi_clusters <- c("8", "11" ,"13")
+low_umi_cluster_cells <- WhichCells(group_subset, idents = low_umi_clusters)
+subset_clusters <- levels(group_subset$subset_clusters)
+subset_clusters <- subset_clusters[!subset_clusters %in% low_umi_clusters]
+group_subset <- subset(group_subset, idents = low_umi_clusters, invert = TRUE)
+
+# Define T cell minor group marker genes
+DefaultAssay(group_subset) <- "RNA"
+Idents(group_subset) <- "subset_clusters"
+Tcell_markers <- c(
+  "Cd3e", # T cells
+  "Cd4", # CD4 T cells
+  "Cd8b1", # CD8 T cells
+  "Trdc", # gammadelta T cells
+  "Klrb1c" # NKT cells
+)
+# Determine per cluster average expression
+avg_expression_Tcell_markers <- AverageExpression(
+  group_subset, features = Tcell_markers, assays = "RNA"
+  )
+
+# Define minor groups by per cluster average expression
+minor_groups <- list(
+  "CD4" = levels(group_subset)[avg_expression_Tcell_markers$RNA["Cd4",] > 2],
+  "CD8" = levels(group_subset)[avg_expression_Tcell_markers$RNA["Cd8b1",] > 2],
+  "NKT" = levels(group_subset)[avg_expression_Tcell_markers$RNA["Klrb1c",] > 1],
+  "gd" = levels(group_subset)[avg_expression_Tcell_markers$RNA["Trdc",] > 2]
+  )
+# Add minor group annotations to Seurat object
+group_subset <- add_minor_group_metadata(seurat = group_subset,
+                                         minor_groups = minor_groups)
+
+# Construct master annotation table for passage back to full Seurat object
+df_masterannotation <- buildmasterannotation(seurat = group_subset)
+
+# Fix low UMI cluster annotations
+df_low_umi <- data.frame(
+  major_group = rep("Tcell", times = length(low_umi_cluster_cells)),
+  minor_group = rep("lowUMI",  times = length(low_umi_cluster_cells)),
+  row.names = low_umi_cluster_cells
+)
+df_masterannotation <- rbind(df_masterannotation, df_low_umi)
+```
+
+### B cell major group
+
+```{r B cell major group annotations}
+# No additional subclustering
+group_to_test <- "Bcell"
+group_subset <- subset(balf_integrated,
+                       ident = major_cell_groups[[group_to_test]]
+                       )
+group_subset$major_group <- factor(group_to_test)
+group_subset$minor_group <- factor(group_to_test)
+group_subset$cluster <- factor(group_to_test)
+
+# Construct master annotation table for passage back to full Seurat object
+df_masterannotation <- buildmasterannotation(
+  seurat = group_subset,
+  df_masterannotation = df_masterannotation
+  )
+```
+
+### NKILC major group
+
+```{r NKILC major cell group annotations}
+# Subset to NKILC cell major cell group, re-run PCA, and re-run clustering
+Idents(balf_integrated) <- "singler_main"
+group_to_test <- "NKILC"
+
+# Subset to NKILC major cell group, re-run PCA, and re-run clustering
+group_subset <- subset_major_group(balf_integrated,
+                                   group_to_test = group_to_test
+                                   )
+ndims <- 10 # From data exploration
+group_subset <- determine_cluster_res(group_subset,
+                                      ndims = ndims, maxres = 4)
+# Set cluster resolution
+cluster_res <- 1
+group_subset[["subset_clusters"]] <- 
+  group_subset@meta.data[,paste0("integrated_snn_res.", cluster_res)]
+
+# No ILCs apparent, rename single minor group
+minor_groups <- list(
+  "NK" = levels(group_subset)
+)  
+# Add minor group annotations to Seurat object
+group_subset <- add_minor_group_metadata(seurat = group_subset,
+                                         minor_groups = minor_groups)
+# Construct master annotation table for passage back to full Seurat object
+df_masterannotation <- buildmasterannotation(
+  seurat = group_subset, df_masterannotation = df_masterannotation)
+```
+
+### Monocyte macrophage major group
+
+```{r MonocyteMacrophage major cell group annotations}
+# Subset to MonocyteMacrophage major group, re-run PCA, and re-run clustering
+Idents(balf_integrated) <- "singler_main"
+group_to_test <- "MonocyteMacrophage"
+
+group_subset <- subset_major_group(balf_integrated,
+                                   group_to_test = group_to_test
+                                   )
+ndims <- 100 # From data exploration
+group_subset <- determine_cluster_res(group_subset,
+                                      ndims = ndims, maxres = 4)
+# Set cluster resolution based on clustree results assessment
+cluster_res <- 1.8
+group_subset[["subset_clusters"]] <- 
+  group_subset@meta.data[,paste0("integrated_snn_res.", cluster_res)]
+```
+
+```{r MonocyteMacrophage minor group marker genes}
+# Define marker genes from:
+# https://doi.org/10.1016/j.ccell.2021.10.009
+# https://doi.org/10.1126/sciimmunol.abf7777
+mac_markers <- list(
+  "All Macrophages" = c("Cd68"),
+  "Alveolar Mac" = c("Plet1", "Net1"),
+  "Monocyte-derived Mac" = c("Ccr2", "H2-Eb1", "Cd52"),
+  "TLF+ (Yolk-sac)" = c("Igf1", "Mrc1"), 
+  "Monocytes" = c("Vcan")
+)
+avg_expression_markers <- AverageExpression(
+  group_subset, features = mac_markers, assays = "RNA"
+  )
+minor_groups <- list(
+  "macrophage_cluster2" =
+    levels(group_subset)[avg_expression_markers$RNA["Plet1",] > 2 &
+                           avg_expression_markers$RNA["Net1",] > 0.5],
+  "macrophage_cluster1" = 
+    levels(group_subset)[avg_expression_markers$RNA["Ccr2",] > 1 &
+                           avg_expression_markers$RNA["Cd52",] > 8]
+  )
+
+# Add minor group annotations to Seurat object
+group_subset <- add_minor_group_metadata(seurat = group_subset,
+                                         minor_groups = minor_groups)
+# Construct master annotation table for passage back to full Seurat object
+df_masterannotation <- buildmasterannotation(
+  seurat = group_subset, df_masterannotation = df_masterannotation)
+```
+
+### DC major group
+
+```{r DC major cell group annotations}
+# Subset to DC major group, re-run PCA, and re-run clustering
+Idents(balf_integrated) <- "singler_main"
+group_to_test <- "DC"
+group_subset <- subset_major_group(balf_integrated,
+                                   group_to_test = group_to_test
+                                   )
+ndims <- 10 # From data exploration
+group_subset <- determine_cluster_res(group_subset,
+                                      ndims = ndims, maxres = 4)
+# Set cluster resolution based on clustree results assessment
+cluster_res <- 1.8 
+group_subset[["subset_clusters"]] <- 
+  group_subset@meta.data[,paste0("integrated_snn_res.", cluster_res)]
+```
+
+```{r DC assign minor groups}
+DefaultAssay(group_subset) <- "RNA"
+Idents(group_subset) <- "subset_clusters"
+markers <- c(
+  "Xcr1", "Clec9a", #cDC1
+  "Sirpa", #cDC2
+  "Fcer1g", # inf-cDC2
+  "Mreg", "Ccr7", # migratory/mreg DC
+  "Tcf4", "Siglech", # pDC
+  "Cx3cr1", "C5ar1" # monocyte-derived DC
+)
+# Determine per cluster average expression
+avg_expression_markers <- AverageExpression(
+  group_subset, features = markers, assays = "RNA"
+  )
+
+# Define minor groups by per cluster average expression
+minor_groups <- list(
+  "cDC1" = levels(group_subset)[
+      avg_expression_markers$RNA["Xcr1",] > 2 &
+      avg_expression_markers$RNA["Clec9a",] > 2],
+  "cDC2" = levels(group_subset)[
+      avg_expression_markers$RNA["Sirpa",] > 1 &
+      avg_expression_markers$RNA["Tcf4",] < 20 &
+      avg_expression_markers$RNA["Fcer1g",] < 10
+      ],
+  "inf_cDC2" = levels(group_subset)[
+      avg_expression_markers$RNA["Sirpa",] > 1 &
+      avg_expression_markers$RNA["Tcf4",] < 20 &
+      avg_expression_markers$RNA["Fcer1g",] > 10
+      ],
+  "mreg_DC" = levels(group_subset)[
+      avg_expression_markers$RNA["Mreg",] > 1 &
+      avg_expression_markers$RNA["Ccr7",] > 10],
+  "pDC" = levels(group_subset)[
+      avg_expression_markers$RNA["Tcf4",] > 20 &
+      avg_expression_markers$RNA["Siglech",] > 10],
+  "monoDC" = levels(group_subset)[
+      avg_expression_markers$RNA["Cx3cr1",] > 1 &
+      avg_expression_markers$RNA["C5ar1",] > 1]
+  )
+
+# Remove any empty list members
+minor_groups <- compact(minor_groups)
+
+# Add minor group annotations to Seurat object
+group_subset <- add_minor_group_metadata(seurat = group_subset,
+                                         minor_groups = minor_groups)
+# Construct master annotation table for passage back to full Seurat object
+df_masterannotation <- buildmasterannotation(
+  seurat = group_subset, df_masterannotation = df_masterannotation)
+```
+
+### Neutrophil major group
+
+```{r Neutrophil cell major cell group annotations}
+# Subset to DC major group, re-run PCA, and re-run clustering
+Idents(balf_integrated) <- "singler_main"
+group_to_test <- "Neutrophil"
+group_subset <- subset_major_group(balf_integrated,
+                                   group_to_test = group_to_test
+                                   )
+ndims <- 5 # From data exploration
+group_subset <- determine_cluster_res(group_subset,
+                                      ndims = ndims, maxres = 4)
+# Set cluster resolution based on clustree results assessment
+cluster_res <- 1.4 # Other stable resolutions also possible
+group_subset[["subset_clusters"]] <- 
+  group_subset@meta.data[,paste0("integrated_snn_res.", cluster_res)]
+
+# No subgroups
+minor_groups <- list(
+  "Neutrophil" = levels(group_subset)
+)  
+
+# Add minor group annotations to Seurat object
+group_subset <- add_minor_group_metadata(seurat = group_subset,
+                                         minor_groups = minor_groups)
+group_subset$major_group <- factor(group_to_test)
+group_subset$minor_group <- factor(group_to_test)
+group_subset$cluster <- factor(group_to_test)
+
+# Construct master annotation table for passage back to full Seurat object
+df_masterannotation <- buildmasterannotation(
+  seurat = group_subset, df_masterannotation = df_masterannotation)
+```
+
+### Nonimmune major group
+
+```{r NonImmune major cell group annotations}
+# Subset to DC major group, re-run PCA, and re-run clustering
+Idents(balf_integrated) <- "singler_main"
+group_to_test <- "Nonimmune"
+
+group_subset <- subset_major_group(balf_integrated,
+                                   group_to_test = group_to_test
+                                   )
+ndims <- 15 # From data exploration
+group_subset <- determine_cluster_res(group_subset,
+                                      ndims = ndims, maxres = 3)
+# Set cluster resolution based on clustree results assessment
+cluster_res <- 1
+group_subset[["subset_clusters"]] <- 
+  group_subset@meta.data[,paste0("integrated_snn_res.", cluster_res)]
+
+# No subgroups
+minor_groups <- list(
+  "Epithelial" = levels(group_subset)
+)  
+
+# Add minor group annotations to Seurat object
+group_subset <- add_minor_group_metadata(seurat = group_subset,
+                                         minor_groups = minor_groups)
+# Construct master annotation table for passage back to full Seurat object
+df_masterannotation <- buildmasterannotation(
+  seurat = group_subset, df_masterannotation = df_masterannotation)
+```
+
+## Construct final annotated Seurat object
+
+```{r Construct final annotated Seurat object}
+balf_integrated <- AddMetaData(balf_integrated,
+                                  metadata = df_masterannotation
+                                  )
+# Remove intermediate cluster columns from metadata
+balf_integrated@meta.data[,
+                             grep(
+                               colnames(balf_integrated@meta.data),
+                               pattern = "^integrated_snn_res*")
+                             ] <- NULL
+
+# Exclude low UMI clusters
+Idents(balf_integrated) <- "cluster_subname"
+balf_integrated <- subset(balf_integrated, idents = "lowUMI", invert = TRUE)
+```
+
+## Final annotations
+
+### Major group level
+
+```{r final umap major group}
+DimPlot(balf_integrated, group.by = "major_group",
+             pt.size = 0.001, label = FALSE) +
+  labs(title = "Cell annotations", subtitle = "Major group level") +
+  scale_color_manual(
+    values = DiscretePalette(length(unique(balf_integrated$major_group)),
+                             palette = "alphabet")) +
+  theme(
+    axis.text = element_text(size =6),
+    axis.title = element_text(size = 6),
+    aspect.ratio = 1,
+    plot.title = element_text(hjust = 0),
+    legend.text = element_text(size = 6)
+  )
+```
+
+### Minor group level
+
+```{r final umap minor group}
+DimPlot(balf_integrated, group.by = "minor_group",
+             pt.size = 0.001, label = FALSE) +
+  labs(title = "Cell annotations", subtitle = "Minor group level") +
+  scale_color_manual(
+    values = DiscretePalette(length(unique(balf_integrated$minor_group)),
+                             palette = "alphabet")) +
+  theme(
+    axis.text = element_text(size =6),
+    axis.title = element_text(size = 6),
+    aspect.ratio = 1,
+    plot.title = element_text(hjust = 0),
+    legend.text = element_text(size = 6)
+  )
+```
+
+## Output final annotation object
+
+```{r Output final annotation object}
+# Clean up intermediate metadata
+DefaultAssay(balf_integrated) <- "RNA"
+
+# Write object to RDS file
+saveRDS(balf_integrated,
+        file = paste0(path_deriveddata, "sarscov2iavbalf_scRNASeq.RDS")
+        )
+```
+
+# Colophon
+
+This report was generated on `r Sys.time()` using the following computational environment and dependencies: 
+
+```{r colophon, cache = FALSE}
+# which R packages and versions?
+if ("devtools" %in% installed.packages()) devtools::session_info()
+```
+
+The current Git commit details are:
+
+```{r git commit details}
+# what commit is this file at? 
+if ("git2r" %in% installed.packages() & git2r::in_repository(path = ".")) git2r::repository(here::here())  
+```
