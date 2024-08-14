@@ -1,4 +1,4 @@
-# Antiviral innate immune memory in alveolar-macrophages following SARS-CoV-2 infection
+# Antiviral innate immune memory in alveolar macrophages following SARS-CoV-2 infection
 
 This repository contains the code to reproduce all transcriptomic and epigenomic analyses from the manuscript
 
