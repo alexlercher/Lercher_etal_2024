@@ -1,7 +1,7 @@
-XR090_heatmap_fpkm_filter
+XR090_DESeq2_MA10
 ================
 Alexander Lercher
-2025-06-18
+2025-06-19
 
 ## R Markdown
 
@@ -639,7 +639,7 @@ if ("devtools" %in% installed.packages()) devtools::session_info()
     ##  collate  en_US.UTF-8
     ##  ctype    en_US.UTF-8
     ##  tz       America/New_York
-    ##  date     2025-06-18
+    ##  date     2025-06-19
     ##  pandoc   3.2 @ /Applications/RStudio.app/Contents/Resources/app/quarto/bin/tools/aarch64/ (via rmarkdown)
     ##  quarto   1.5.57 @ /Applications/RStudio.app/Contents/Resources/app/quarto/bin/quarto
     ## 
